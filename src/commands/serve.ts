@@ -1463,7 +1463,7 @@ export async function cmdServe() {
       // ---- github repos ----
       if (path === "/api/github/repos") {
         if (!githubConfigured())
-          return err(501, "GITHUB_TOKEN is not set — add it to the lfg service environment");
+          return err(501, "Omni_Agent_Github_PAT is not set — add it to the lfg service environment");
         try {
           const repos = await fetchGithubRepos();
           return json({ repos });
@@ -1474,7 +1474,7 @@ export async function cmdServe() {
 
       if (path === "/api/github/repos/clone" && req.method === "POST") {
         if (!githubConfigured())
-          return err(501, "GITHUB_TOKEN is not set");
+          return err(501, "Omni_Agent_Github_PAT is not set");
         const body = (await req.json().catch(() => null)) as {
           clone_url?: string;
           name?: string;

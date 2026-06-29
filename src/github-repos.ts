@@ -20,7 +20,7 @@ export type GithubRepo = {
 };
 
 function token(): string | null {
-  return process.env.GITHUB_TOKEN ?? null;
+  return process.env.Omni_Agent_Github_PAT ?? null;
 }
 
 export function githubConfigured(): boolean {
