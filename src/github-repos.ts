@@ -74,14 +74,6 @@ export async function cloneGithubRepo(
   const dest = join(root, basename(repoName));
 
   if (existsSync(join(dest, ".git"))) {
-    // Already cloned — just pull latest.
-    const pull = Bun.spawnSync(["git", "-C", dest, "pull", "--ff-only"], {
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    if (pull.exitCode !== 0) {
-      // Non-fatal: repo exists, just couldn't fast-forward. Return existing path.
-    }
     await addCustomRepo(dest, repoName);
     return dest;
   }
