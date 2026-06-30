@@ -84,14 +84,15 @@ export async function cloneGithubRepo(
     url = url.replace("https://", `https://oauth2:${tok}@`);
   }
 
-  const clone = Bun.spawnSync(["git", "clone", "--depth", "1", url, dest], {
+  const clone = Bun.spawn(["git", "clone", "--depth", "1", url, dest], {
     stdout: "pipe",
     stderr: "pipe",
   });
+  const exitCode = await clone.exited;
 
-  if (clone.exitCode !== 0) {
-    const err = new TextDecoder().decode(clone.stderr);
-    throw new Error(`git clone failed: ${err.slice(0, 400)}`);
+  if (exitCode !== 0) {
+    const errText = await new Response(clone.stderr).text();
+    throw new Error(`git clone failed: ${errText.slice(0, 400)}`);
   }
 
   await addCustomRepo(dest, repoName);

@@ -6818,6 +6818,13 @@ function NewSessionDialog({
   const [githubError, setGithubError] = useState<string | null>(null);
   const [githubCloning, setGithubCloning] = useState<string | null>(null);
 
+  const closeGithubPicker = useCallback(() => {
+    setGithubPickerOpen(false);
+    // Reset the select back to the previously chosen repo so it doesn't stay
+    // stuck on the synthetic "__github__" option after dismissing the dialog.
+    setRepo((prev) => (prev === "__github__" ? localStorage.getItem("lfg_v2_repo") || "" : prev));
+  }, []);
+
   const openGithubPicker = useCallback(async () => {
     setGithubPickerOpen(true);
     setGithubError(null);
@@ -6849,7 +6856,7 @@ function NewSessionDialog({
       if (!res.ok || !j.cwd) throw new Error(j.error ?? "clone failed");
       await onReposChanged();
       setRepo(j.cwd);
-      setGithubPickerOpen(false);
+      setGithubPickerOpen(false); // don't reset repo — we just set it above
       toast.success(`Cloned ${name}`);
     } catch (e) {
       toast.error(e instanceof Error ? e.message : String(e));
@@ -7223,12 +7230,12 @@ function NewSessionDialog({
       {githubPickerOpen && createPortal(
         <div
           className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 p-4"
-          onClick={(e) => { if (e.target === e.currentTarget) setGithubPickerOpen(false); }}
+          onClick={(e) => { if (e.target === e.currentTarget) closeGithubPicker(); }}
         >
           <div className="flex w-full max-w-md flex-col gap-3 rounded-xl bg-background p-4 shadow-xl pointer-events-auto">
             <div className="flex items-center justify-between">
               <span className="text-sm font-semibold">Import from GitHub</span>
-              <button type="button" onClick={() => setGithubPickerOpen(false)} className="text-muted-foreground hover:text-foreground">
+              <button type="button" onClick={closeGithubPicker} className="text-muted-foreground hover:text-foreground">
                 <X className="size-4" />
               </button>
             </div>
