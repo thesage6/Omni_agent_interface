@@ -7225,7 +7225,7 @@ function NewSessionDialog({
           className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 p-4"
           onClick={(e) => { if (e.target === e.currentTarget) setGithubPickerOpen(false); }}
         >
-          <div className="flex w-full max-w-md flex-col gap-3 rounded-xl bg-background p-4 shadow-xl">
+          <div className="flex w-full max-w-md flex-col gap-3 rounded-xl bg-background p-4 shadow-xl pointer-events-auto">
             <div className="flex items-center justify-between">
               <span className="text-sm font-semibold">Import from GitHub</span>
               <button type="button" onClick={() => setGithubPickerOpen(false)} className="text-muted-foreground hover:text-foreground">
@@ -7257,7 +7257,7 @@ function NewSessionDialog({
                     type="button"
                     disabled={githubCloning === r.name}
                     onClick={() => cloneGithubRepo(r.clone_url, r.name)}
-                    className="flex w-full items-start gap-2 rounded-lg px-2 py-2 text-left hover:bg-muted disabled:opacity-50"
+                    className="flex w-full items-start gap-2 rounded-lg px-2 py-2 text-left hover:bg-muted disabled:opacity-50 pointer-events-auto"
                   >
                     <GitFork className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
                     <div className="min-w-0">
