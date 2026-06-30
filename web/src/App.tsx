@@ -7222,7 +7222,7 @@ function NewSessionDialog({
       {/* GitHub repo picker dialog */}
       {githubPickerOpen && createPortal(
         <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+          className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 p-4"
           onClick={(e) => { if (e.target === e.currentTarget) setGithubPickerOpen(false); }}
         >
           <div className="flex w-full max-w-md flex-col gap-3 rounded-xl bg-background p-4 shadow-xl">
