@@ -90,7 +90,7 @@ import {
 } from "../tmux.ts";
 import { addManaged, removeManaged } from "../managed.ts";
 import { PtyBridge, termSessionName } from "../pty.ts";
-import { capturePaneScroll, capturePaneEscaped, paneWidth } from "../tmux.ts";
+import { capturePaneCoalesced, capturePaneScroll, capturePaneEscaped, paneWidth } from "../tmux.ts";
 import { detectUrls } from "../links.ts";
 import type { ServerWebSocket } from "bun";
 import { appendCmd as appendAisdkCmd, removeEntry as removeAisdkEntry, readEntry as readAisdkEntry, findEntryByAnyId as findAisdkEntryByAnyId, isEntryBusy as isAisdkEntryBusy } from "../aisdk-registry.ts";
@@ -367,7 +367,9 @@ async function voiceStatusSnapshot(user?: string | null): Promise<string> {
     let status = "IDLE";
     let detail = "";
     if (s.tmuxTarget) {
-      const pane = capturePane(s.tmuxTarget);
+      // Coalesced: listSessions() just scraped this same pane for its busy
+      // flag, so within the 300ms window this reuses that capture.
+      const pane = capturePaneCoalesced(s.tmuxTarget);
       const tp = s.sessionId ? await resolveTranscript(s.sessionId) : null;
       const prompt = await resolveSessionPrompt(tp, pane);
       if (prompt) {
@@ -560,6 +562,7 @@ function sseHeaders(): Record<string, string> {
 
 type SessionPromptValue = Awaited<ReturnType<typeof resolveSessionPrompt>>;
 
+
 // Incremental JSONL tailer for one transcript. seedBacklog() emits the last
 // `n` messages and pins the offset to EOF; each pump() then reads only newly
 // appended bytes, reassembles complete lines across chunk boundaries, and
@@ -628,7 +631,9 @@ function makeSessionStatePoller(opts: {
       emitBusyGated(isAisdkEntryBusy(entry));
       return;
     }
-    const pane = capturePane(opts.target);
+    // Coalesced: N clients polling the same pane share one scrape per 300ms
+    // window (see capturePaneCoalesced) instead of N blocking spawns a second.
+    const pane = capturePaneCoalesced(opts.target);
     const prompt = await resolveSessionPrompt(opts.tp, pane);
     const sig = prompt ? JSON.stringify(prompt) : "";
     if (sig !== lastSig) {

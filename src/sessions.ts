@@ -3,7 +3,7 @@
 import { readdir, readlink } from "node:fs/promises";
 import { statSync, readFileSync } from "node:fs";
 import { join, basename } from "node:path";
-import { panePidForSession, tmuxHasSession, tmuxTargetForPid, capturePane, isBusy } from "./tmux";
+import { panePidForSession, tmuxHasSession, tmuxTargetForPid, capturePaneCoalesced, isBusy } from "./tmux";
 import { isManagedName, listManaged } from "./managed";
 import {
   listEntries as listAisdkEntries,
@@ -1489,7 +1489,9 @@ export async function listSessions(): Promise<Session[]> {
 function sessionBusy(s: Session): boolean {
   try {
     if (s.tmuxTarget) {
-      const pane = capturePane(s.tmuxTarget);
+      // Coalesced: the SSE pollers and concurrent /api/sessions polls scrape
+      // the same panes — share one capture per 300ms window across all of them.
+      const pane = capturePaneCoalesced(s.tmuxTarget);
       return pane ? isBusy(pane) : false;
     }
     if (s.sessionId) {

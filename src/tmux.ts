@@ -509,6 +509,34 @@ export function capturePane(target: string): string | null {
   }
 }
 
+// Coalescing variant for the periodic pollers (SSE session streams, the
+// listSessions busy computation, voice status snapshots). Each of those runs
+// per client on a 1–5s cadence, and every call is a SYNCHRONOUS tmux spawn
+// that blocks Bun's single-threaded event loop — so N clients watching the
+// same session multiply into N identical spawns per tick. Memoizing per pane
+// target for 300ms collapses that to one spawn per target per window while
+// staying well under every poller's cadence (each tick still sees a fresh
+// frame).
+//
+// The send queue (sendq.ts) and the prompt answer/dismiss loops must NOT use
+// this: they re-capture at ~100–150ms to confirm their own keystrokes landed,
+// and a stale frame there would break the type→verify→Enter handshake.
+const PANE_COALESCE_TTL_MS = 300;
+const paneCoalesceCache = new Map<string, { at: number; pane: string | null }>();
+export function capturePaneCoalesced(target: string): string | null {
+  const now = Date.now();
+  const hit = paneCoalesceCache.get(target);
+  if (hit && now - hit.at < PANE_COALESCE_TTL_MS) return hit.pane;
+  const pane = capturePane(target);
+  paneCoalesceCache.set(target, { at: now, pane });
+  // Opportunistic pruning so targets from closed sessions don't accumulate;
+  // the map only ever holds actively-watched panes so this rarely fires.
+  if (paneCoalesceCache.size > 64) {
+    for (const [k, v] of paneCoalesceCache) if (now - v.at > 5_000) paneCoalesceCache.delete(k);
+  }
+  return pane;
+}
+
 // Capture a pane (no line-join) with some scrollback. We deliberately do NOT
 // pass -J: long URLs are often broken by the app's own hard wrap, not tmux
 // auto-wrap, so -J can't rejoin them — link reconstruction handles the joining
