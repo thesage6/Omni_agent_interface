@@ -28,7 +28,10 @@ function loadOpenpty(): any {
           returns: FFIType.int,
         },
       });
-      if (h.symbols.openpty) return h;
+      // dlopen resolves the symbol eagerly, but guard against a null slot from
+      // a library that lacks openpty (compare to null — a truthiness test on
+      // the function type trips TS2774).
+      if (h.symbols.openpty != null) return h;
     } catch {}
   }
   throw new Error("openpty() not found in system libraries - cannot allocate a PTY");

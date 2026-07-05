@@ -35,58 +35,42 @@ export function ensureFolderTrusted(cwd: string): void {
   }
 }
 
-// Resolve the `claude` executable to an absolute path. We must NOT rely on a
-// bare `claude` in the spawn: when lfg runs as a systemd service its PATH
-// often lacks ~/.local/bin, so `tmux new-session … claude` can't exec claude
-// and the session dies on the spot (looks like "can't create a session"). Bun
-// .which() honours the current PATH; fall back to the known install locations.
-let _claudeBin: string | null = null;
+// Resolve an agent CLI executable to an absolute path. We must NOT rely on a
+// bare name in the spawn: when lfg runs as a systemd service its PATH often
+// lacks ~/.local/bin, so `tmux new-session … claude` can't exec claude and the
+// session dies on the spot (looks like "can't create a session"). Bun.which()
+// honours the current PATH; fall back to the known install locations, then to
+// the bare name as a last resort so the failure surfaces where it happened.
+const binCache = new Map<string, string>();
+function resolveBin(name: string, extraCandidates: string[] = []): string {
+  const hit = binCache.get(name);
+  if (hit) return hit;
+  const set = (v: string) => (binCache.set(name, v), v);
+  const onPath = Bun.which(name);
+  if (onPath) return set(onPath);
+  const home = process.env.HOME ?? homedir();
+  for (const p of [
+    `${home}/.local/bin/${name}`,
+    `${home}/.bun/bin/${name}`,
+    ...extraCandidates,
+    `/usr/local/bin/${name}`,
+  ]) {
+    if (existsSync(p)) return set(p);
+  }
+  return set(name);
+}
+
 export function claudeBin(): string {
-  if (_claudeBin) return _claudeBin;
-  const onPath = Bun.which("claude");
-  if (onPath) return (_claudeBin = onPath);
-  const home = process.env.HOME ?? homedir();
-  for (const p of [
-    `${home}/.local/bin/claude`,
-    `${home}/.bun/bin/claude`,
-    "/usr/local/bin/claude",
-  ]) {
-    if (existsSync(p)) return (_claudeBin = p);
-  }
-  return (_claudeBin = "claude"); // last resort: let the failure surface
+  return resolveBin("claude");
 }
 
-let _codexBin: string | null = null;
 export function codexBin(): string {
-  if (_codexBin) return _codexBin;
-  const onPath = Bun.which("codex");
-  if (onPath) return (_codexBin = onPath);
-  const home = process.env.HOME ?? homedir();
-  for (const p of [
-    `${home}/.local/bin/codex`,
-    `${home}/.bun/bin/codex`,
-    "/usr/local/bin/codex",
-  ]) {
-    if (existsSync(p)) return (_codexBin = p);
-  }
-  return (_codexBin = "codex");
+  return resolveBin("codex");
 }
 
-let _grokBin: string | null = null;
 export function grokBin(): string {
-  if (_grokBin) return _grokBin;
-  const onPath = Bun.which("grok");
-  if (onPath) return (_grokBin = onPath);
   const home = process.env.HOME ?? homedir();
-  for (const p of [
-    `${home}/.local/bin/grok`,
-    `${home}/.bun/bin/grok`,
-    `${home}/.grok/downloads/grok-linux-x86_64`,
-    "/usr/local/bin/grok",
-  ]) {
-    if (existsSync(p)) return (_grokBin = p);
-  }
-  return (_grokBin = "grok");
+  return resolveBin("grok", [`${home}/.grok/downloads/grok-linux-x86_64`]);
 }
 
 // Spawned agents run with cwd set to one repo, but Claude Code scopes tool

@@ -14,6 +14,7 @@ import {
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { timeAgo } from "@/lib/time";
 import BrowserLoginView from "./BrowserLoginView";
 
 // Manage saved cloud-browser login profiles. Each profile captures the cookies
@@ -82,17 +83,6 @@ function computeViewport(mode: ViewportMode): Viewport {
 }
 
 const VIEWPORT_KEY = "lfg_browser_viewport_mode";
-
-function timeAgo(value?: number | null): string {
-  if (!value) return "never";
-  const seconds = Math.max(0, Math.round((Date.now() - value) / 1000));
-  if (seconds < 60) return `${seconds}s ago`;
-  const minutes = Math.round(seconds / 60);
-  if (minutes < 60) return `${minutes}m ago`;
-  const hours = Math.round(minutes / 60);
-  if (hours < 48) return `${hours}h ago`;
-  return `${Math.round(hours / 24)}d ago`;
-}
 
 // The active live-browser session, if any. Tracks why it was opened so we can
 // refresh + clear test state on save.
@@ -317,7 +307,7 @@ export default function BrowserProfiles() {
                         {p.origins.length ? p.origins.join(", ") : "no origins"}
                       </div>
                       <div className="mt-0.5 text-xs text-muted-foreground/80">
-                        Last used {timeAgo(p.lastUsedAt)}
+                        Last used {timeAgo(p.lastUsedAt, "never")}
                       </div>
                       {test ? (
                         <div

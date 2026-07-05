@@ -10,5 +10,9 @@
     "strict": true,
     "skipLibCheck": true,
     "types": ["bun-types"]
-  }
+  },
+  // Backend only. web/ is its own package with its own tsconfig (JSX + DOM
+  // libs); without this include, a root `tsc --noEmit` sweeps web/ and deploy/
+  // up with Bun-only settings and fails on every JSX/DOM reference.
+  "include": ["src"]
 }

@@ -64,6 +64,7 @@ import {
   cwdForTranscript,
   cwdForCodexTranscript,
   type PendingPrompt,
+  type SessionMsg,
 } from "../sessions.ts";
 import {
   capturePane,
@@ -795,6 +796,118 @@ function sseHeaders(): Record<string, string> {
   };
 }
 
+// ---------- live-stream pollers ----------
+// Shared by /api/live/stream (multi-session) and /api/sessions/:id/stream
+// (single-session). Both endpoints tail the same transcript files and poll the
+// same pane/registry/queue state — only the SSE envelope differs, so each
+// helper owns the per-session state + change-gating and hands the payload to
+// an endpoint-supplied emit callback.
+
+type SessionPromptValue = Awaited<ReturnType<typeof resolveSessionPrompt>>;
+
+// Incremental JSONL tailer for one transcript. seedBacklog() emits the last
+// `n` messages and pins the offset to EOF; each pump() then reads only newly
+// appended bytes, reassembles complete lines across chunk boundaries, and
+// emits each line's normalized messages.
+function makeTranscriptTailer(
+  tp: string,
+  emitMsg: (m: ReturnType<typeof msgWithHtml<SessionMsg>>) => void,
+) {
+  let offset = 0;
+  let buf = "";
+  return {
+    async seedBacklog(n = 40) {
+      for (const m of (await recentMessages(tp, n)).map(msgWithHtml)) emitMsg(m);
+      offset = Bun.file(tp).size;
+    },
+    async pump() {
+      try {
+        const f = Bun.file(tp);
+        const size = f.size;
+        if (size < offset) offset = 0; // rotated/truncated
+        if (size > offset) {
+          const chunk = await f.slice(offset, size).text();
+          offset = size;
+          buf += chunk;
+          const lines = buf.split("\n");
+          buf = lines.pop() ?? "";
+          for (const l of lines) {
+            if (!l) continue;
+            for (const msg of normalizeLineMessages(l)) emitMsg(msgWithHtml(msg));
+          }
+        }
+      } catch {}
+    },
+  };
+}
+
+// One session's interactive-state poller. Pane-backed sessions get prompt +
+// busy scraped from tmux; pane-less (aisdk-family) sessions get busy from the
+// registry — there are no pane-scraped prompts, and for codex-aisdk the sid
+// may be the threadId rather than the control-plane key, so the registry is
+// looked up by either. Emits only on change. Busy starts from a "?" sentinel
+// (not "0") so the first poll always emits the CURRENT busy state as a
+// baseline — without it, a client reconnecting (e.g. after a serve restart)
+// while holding a stale busy=true never gets a corrective event, because the
+// implicit "0" baseline matches a now-idle session and the change-gate
+// suppresses the emit, leaving the card stuck showing "Working".
+function makeSessionStatePoller(opts: {
+  sid: string;
+  tp: string;
+  target: string | null;
+  emitPrompt: (prompt: SessionPromptValue) => void;
+  emitBusy: (busy: boolean) => void;
+}) {
+  let lastSig = " ";
+  let lastBusy = "?";
+  const emitBusyGated = (busy: boolean) => {
+    const bsig = busy ? "1" : "0";
+    if (bsig === lastBusy) return;
+    lastBusy = bsig;
+    opts.emitBusy(busy);
+  };
+  return async () => {
+    if (!opts.target) {
+      const entry = findAisdkEntryByAnyId(opts.sid);
+      if (!entry) return;
+      emitBusyGated(isAisdkEntryBusy(entry));
+      return;
+    }
+    const pane = capturePane(opts.target);
+    const prompt = await resolveSessionPrompt(opts.tp, pane);
+    const sig = prompt ? JSON.stringify(prompt) : "";
+    if (sig !== lastSig) {
+      lastSig = sig;
+      opts.emitPrompt(prompt ?? null);
+    }
+    emitBusyGated(pane ? isBusy(pane) : false);
+  };
+}
+
+// Change-gated send-queue watcher. tick() re-reads the queue and, after
+// reconcileQueued() flips "queued" rows to delivered/failed from the
+// transcript, re-emits immediately instead of waiting for the next tick.
+function makeQueueWatcher(
+  sid: string,
+  emitQueue: (queue: ReturnType<typeof listQueue>) => void,
+) {
+  let lastQ = "[]";
+  const poll = () => {
+    const queue = listQueue(sid);
+    const sig = JSON.stringify(queue);
+    if (sig === lastQ) return;
+    lastQ = sig;
+    emitQueue(queue);
+  };
+  return {
+    poll,
+    tick() {
+      poll();
+      void reconcileQueued(sid).then((c) => c && poll());
+    },
+  };
+}
+
 // ---------- server ----------
 
 // Per-socket state for the browser terminal: which tmux session it attaches to
@@ -825,7 +938,11 @@ const browserSocketCbs = new WeakMap<
   { onMessage?: (d: string) => void; onClose?: () => void }
 >();
 
-function makeBrowserWS(ws: ServerWebSocket<TermSocketData>): WSLike {
+// All three socket kinds multiplex through the same Bun websocket handlers;
+// the shape of ws.data (set at upgrade time) is what tells them apart.
+type LfgSocketData = TermSocketData | SttStreamSocketData | BrowserSocketData;
+
+function makeBrowserWS(ws: ServerWebSocket<LfgSocketData>): WSLike {
   const cbs: { onMessage?: (d: string) => void; onClose?: () => void } = {};
   browserSocketCbs.set(ws, cbs);
   return {
@@ -867,12 +984,12 @@ export async function cmdServe() {
       // text frames are JSON control messages (resize). Output is streamed back
       // as binary frames — the full raw VT byte stream a faithful renderer wants.
       idleTimeout: 600,
-      open(ws: ServerWebSocket<TermSocketData>) {
+      open(ws: ServerWebSocket<LfgSocketData>) {
         // Streaming-STT bridge socket: open the upstream realtime-STT bridge and
         // pipe its results back as {partial,final} text frames. Built synchronously
         // (the bridge queues outbound audio until its upstream connects), so the
         // first PCM frame in message() always finds a bridge.
-        if ((ws.data as unknown as SttStreamSocketData)?.sttStream) {
+        if (ws.data && "sttStream" in ws.data) {
           const send = (o: unknown) => {
             try {
               ws.send(JSON.stringify(o));
@@ -897,9 +1014,8 @@ export async function cmdServe() {
           return;
         }
         // Cloud-browser login viewer socket: bridge to the session streamer.
-        const bSid = (ws.data as unknown as BrowserSocketData)?.browserSessionId;
-        if (typeof bSid === "string") {
-          attachStream(bSid, makeBrowserWS(ws));
+        if (ws.data && "browserSessionId" in ws.data) {
+          attachStream(ws.data.browserSessionId, makeBrowserWS(ws));
           return;
         }
         try {
@@ -926,7 +1042,7 @@ export async function cmdServe() {
           } catch {}
         }
       },
-      message(ws: ServerWebSocket<TermSocketData>, message) {
+      message(ws: ServerWebSocket<LfgSocketData>, message) {
         // Streaming-STT bridge: binary frames are raw 16 kHz PCM; text frames are
         // the worker's {"type":"flush"|"eof"} control messages.
         const sttBridge = sttBridges.get(ws);
@@ -965,7 +1081,7 @@ export async function cmdServe() {
         // Binary frame = raw keystrokes.
         bridge.write(message as Uint8Array);
       },
-      close(ws: ServerWebSocket<TermSocketData>) {
+      close(ws: ServerWebSocket<LfgSocketData>) {
         // Streaming-STT bridge: tear the upstream realtime-STT socket down.
         const sttBridge = sttBridges.get(ws);
         if (sttBridge) {
@@ -979,8 +1095,8 @@ export async function cmdServe() {
           bCbs.onClose?.();
           // Viewer closed: tear the headless browser down so it doesn't leak on
           // this shared box (the saved profile already persists to disk).
-          const sid = (ws.data as unknown as BrowserSocketData)?.browserSessionId;
-          if (sid) void endSession(sid);
+          if (ws.data && "browserSessionId" in ws.data && ws.data.browserSessionId)
+            void endSession(ws.data.browserSessionId);
           return;
         }
         const bridge = termBridges.get(ws);
@@ -999,7 +1115,7 @@ export async function cmdServe() {
         const sessionName = termSessionName(url.searchParams.get("session") || "main");
         const cols = clampDim(url.searchParams.get("cols"), 80);
         const rows = clampDim(url.searchParams.get("rows"), 24);
-        const ok = server.upgrade<TermSocketData>(req, {
+        const ok = server.upgrade(req, {
           data: { sessionName, cols, rows },
         });
         if (ok) return undefined; // upgraded — Bun takes over the socket
@@ -1011,7 +1127,7 @@ export async function cmdServe() {
       // its raw-PCM/{flush,eof} protocol to the configured realtime-STT provider
       // (ElevenLabs Scribe v2 Realtime) in voice-providers.ts.
       if (path === "/api/voice/stt-stream") {
-        const ok = server.upgrade<SttStreamSocketData>(req, {
+        const ok = server.upgrade(req, {
           data: { sttStream: true },
         });
         if (ok) return undefined; // upgraded — Bun takes over the socket
@@ -1022,7 +1138,7 @@ export async function cmdServe() {
       {
         const m = path.match(/^\/api\/browser\/sessions\/([^/]+)\/stream$/);
         if (m) {
-          const ok = server.upgrade<BrowserSocketData>(req, {
+          const ok = server.upgrade(req, {
             data: { browserSessionId: decodeURIComponent(m[1]) },
           });
           if (ok) return undefined;
@@ -1764,7 +1880,7 @@ export async function cmdServe() {
             status?: "open" | "dismissed" | "session" | "read";
             sessionId?: string;
           } | null;
-          const patch: { status?: typeof b.status; sessionId?: string } = {};
+          const patch: { status?: NonNullable<typeof b>["status"]; sessionId?: string } = {};
           if (b?.status) patch.status = b.status;
           if (b?.sessionId) patch.sessionId = b.sessionId;
           const f = await updateFinding(m[1], patch);
@@ -2855,115 +2971,49 @@ export async function cmdServe() {
                 closed = true;
               }
             };
-            const offsets = new Map<string, number>();
-            const bufs = new Map<string, string>();
-            const lastSig = new Map<string, string>();
-            const pumpOne = async (p: { sid: string; tp: string }) => {
-              if (closed) return;
-              try {
-                const f = Bun.file(p.tp);
-                const size = f.size;
-                let offset = offsets.get(p.sid) ?? 0;
-                if (size < offset) offset = 0; // rotated/truncated
-                if (size > offset) {
-                  const chunk = await f.slice(offset, size).text();
-                  offsets.set(p.sid, size);
-                  let buf = (bufs.get(p.sid) ?? "") + chunk;
-                  const lines = buf.split("\n");
-                  bufs.set(p.sid, lines.pop() ?? "");
-                  for (const l of lines) {
-                    if (!l) continue;
-                    const msgs = normalizeLineMessages(l);
-                    for (const msg of msgs)
-                      send(
-                        `event: msg\ndata: ${JSON.stringify({ sid: p.sid, m: msgWithHtml(msg) })}\n\n`,
-                      );
-                  }
-                }
-              } catch {}
-            };
-            const lastBusy = new Map<string, string>();
-            const pollOne = async (p: {
-              sid: string;
-              tp: string;
-              target: string | null;
-            }) => {
-              if (closed) return;
-              if (!p.target) {
-                // Pane-less (aisdk / codex-aisdk) session: busy comes from the
-                // registry, and there are no pane-scraped prompts. For a
-                // codex-aisdk session the sid may be the threadId rather than the
-                // control-plane key, so look it up by either.
-                const entry = findAisdkEntryByAnyId(p.sid);
-                if (!entry) return;
-                const busy = isAisdkEntryBusy(entry);
-                const bsig = busy ? "1" : "0";
-                if (bsig !== (lastBusy.get(p.sid) ?? "0")) {
-                  lastBusy.set(p.sid, bsig);
-                  send(`event: busy\ndata: ${JSON.stringify({ sid: p.sid, busy })}\n\n`);
-                }
-                return;
-              }
-              const pane = capturePane(p.target);
-              const prompt = await resolveSessionPrompt(p.tp, pane);
-              if (closed) return;
-              const sig = prompt ? JSON.stringify(prompt) : "";
-              if (sig !== (lastSig.get(p.sid) ?? " ")) {
-                lastSig.set(p.sid, sig);
-                send(
-                  `event: prompt\ndata: ${JSON.stringify({ sid: p.sid, prompt: prompt ?? null })}\n\n`,
-                );
-              }
-              const busy = pane ? isBusy(pane) : false;
-              const bsig = busy ? "1" : "0";
-              if (bsig !== (lastBusy.get(p.sid) ?? "0")) {
-                lastBusy.set(p.sid, bsig);
-                send(`event: busy\ndata: ${JSON.stringify({ sid: p.sid, busy })}\n\n`);
-              }
-            };
-            const lastQ = new Map<string, string>();
-            const queueOne = (p: { sid: string }) => {
-              if (closed) return;
-              const queue = listQueue(p.sid);
-              const sig = JSON.stringify(queue);
-              if (sig === (lastQ.get(p.sid) ?? "[]")) return;
-              lastQ.set(p.sid, sig);
-              send(`event: queue\ndata: ${JSON.stringify({ sid: p.sid, queue })}\n\n`);
-            };
+            // One tailer + state poller + queue watcher per session (see the
+            // live-stream pollers section above); every event is wrapped in a
+            // {sid, …} envelope so the client can demux the shared stream.
+            const sessions = panes.map((p) => ({
+              sid: p.sid,
+              tailer: makeTranscriptTailer(p.tp, (m) =>
+                send(`event: msg\ndata: ${JSON.stringify({ sid: p.sid, m })}\n\n`),
+              ),
+              poll: makeSessionStatePoller({
+                sid: p.sid,
+                tp: p.tp,
+                target: p.target,
+                emitPrompt: (prompt) =>
+                  send(`event: prompt\ndata: ${JSON.stringify({ sid: p.sid, prompt })}\n\n`),
+                emitBusy: (busy) =>
+                  send(`event: busy\ndata: ${JSON.stringify({ sid: p.sid, busy })}\n\n`),
+              }),
+              queue: makeQueueWatcher(p.sid, (queue) =>
+                send(`event: queue\ndata: ${JSON.stringify({ sid: p.sid, queue })}\n\n`),
+              ),
+            }));
             (async () => {
               for (const sid of missingIds) {
                 send(`event: ready\ndata: ${JSON.stringify({ sid })}\n\n`);
               }
-              for (const p of panes) {
+              for (const s of sessions) {
                 try {
-                  const msgs = (await recentMessages(p.tp, 40)).map(msgWithHtml);
-                  for (const m of msgs)
-                    send(`event: msg\ndata: ${JSON.stringify({ sid: p.sid, m })}\n\n`);
-                  offsets.set(p.sid, Bun.file(p.tp).size);
-                  lastSig.set(p.sid, " ");
-                  lastQ.set(p.sid, "[]");
-                  // Seed busy with a sentinel (not "0") so the first pollOne always
-                  // emits the CURRENT busy state as a baseline. Without this, a
-                  // client reconnecting (e.g. after a serve restart) while holding a
-                  // stale busy=true never gets a corrective event, because the new
-                  // connection's implicit "0" baseline matches a now-idle session
-                  // and the change-gate suppresses the emit — leaving the card stuck
-                  // showing "Working".
-                  lastBusy.set(p.sid, "?");
-                  pollOne(p);
-                  queueOne(p);
+                  await s.tailer.seedBacklog();
+                  void s.poll();
+                  s.queue.poll();
                 } finally {
-                  send(`event: ready\ndata: ${JSON.stringify({ sid: p.sid })}\n\n`);
+                  send(`event: ready\ndata: ${JSON.stringify({ sid: s.sid })}\n\n`);
                 }
               }
               iv = setInterval(() => {
-                for (const p of panes) pumpOne(p);
+                if (closed) return;
+                for (const s of sessions) void s.tailer.pump();
               }, 700);
               pi = setInterval(() => {
-                for (const p of panes) {
-                  pollOne(p);
-                  queueOne(p);
-                  void reconcileQueued(p.sid).then((c) => c && queueOne(p));
+                if (closed) return;
+                for (const s of sessions) {
+                  void s.poll();
+                  s.queue.tick();
                 }
               }, 1000);
             })();
@@ -3003,101 +3053,45 @@ export async function cmdServe() {
                   closed = true;
                 }
               };
-              let offset = 0;
-              let buf = "";
-              const pump = async () => {
-                if (closed) return;
-                try {
-                  const f = Bun.file(tp);
-                  const size = f.size;
-                  if (size < offset) offset = 0; // file rotated/truncated
-                  if (size > offset) {
-                    const chunk = await f.slice(offset, size).text();
-                    offset = size;
-                    buf += chunk;
-                    const lines = buf.split("\n");
-                    buf = lines.pop() ?? "";
-                    for (const l of lines) {
-                      if (!l) continue;
-                      const msgs = normalizeLineMessages(l);
-                      for (const msg of msgs)
-                        send(`event: msg\ndata: ${JSON.stringify(msgWithHtml(msg))}\n\n`);
-                    }
-                  }
-                } catch {}
-              };
+              const tailer = makeTranscriptTailer(tp, (m) =>
+                send(`event: msg\ndata: ${JSON.stringify(m)}\n\n`),
+              );
               // backlog, then tail
               (async () => {
-                const msgs = (await recentMessages(tp, 40)).map(msgWithHtml);
-                for (const msg of msgs)
-                  send(`event: msg\ndata: ${JSON.stringify(msg)}\n\n`);
-                offset = Bun.file(tp).size;
+                await tailer.seedBacklog();
                 // Tail fast: the reply is already fully written to the transcript
                 // by the time Claude finishes; a slow poll just adds dead wait
                 // before it reaches the UI. 200ms keeps perceived latency low
                 // without meaningfully more file stats.
-                iv = setInterval(pump, 200);
+                iv = setInterval(() => {
+                  if (!closed) void tailer.pump();
+                }, 200);
               })();
               // Poll the tmux pane for an interactive selector (permission /
-              // plan prompts live in the TUI, not the transcript). Emit only on
-              // change so the client can render/clear a prompt panel.
-              if (target) {
-                let lastSig = " ";
-                // Sentinel (not "0") so the first poll emits the current busy
-                // baseline — corrects a client holding a stale busy across reconnect.
-                let lastBusy = "?";
-                const pollPrompt = async () => {
-                  if (closed) return;
-                  const pane = capturePane(target);
-                  const prompt = await resolveSessionPrompt(tp, pane);
-                  if (closed) return;
-                  const sig = prompt ? JSON.stringify(prompt) : "";
-                  if (sig !== lastSig) {
-                    lastSig = sig;
-                    send(`event: prompt\ndata: ${prompt ? sig : "null"}\n\n`);
-                  }
-                  const bsig = pane && isBusy(pane) ? "1" : "0";
-                  if (bsig !== lastBusy) {
-                    lastBusy = bsig;
-                    send(`event: busy\ndata: ${bsig === "1" ? "true" : "false"}\n\n`);
-                  }
-                };
-                pollPrompt();
-                pi = setInterval(pollPrompt, 1000);
-              } else {
-                // Pane-less (aisdk / codex-aisdk) session: source busy from the
-                // registry — by key or threadId (codex-aisdk's sid is the latter).
-                // Sentinel baseline so the first poll always emits current state.
-                let lastBusy = "?";
-                const pollBusy = () => {
-                  if (closed) return;
-                  const entry = findAisdkEntryByAnyId(sid);
-                  if (!entry) return;
-                  const busy = isAisdkEntryBusy(entry);
-                  const bsig = busy ? "1" : "0";
-                  if (bsig !== lastBusy) {
-                    lastBusy = bsig;
-                    send(`event: busy\ndata: ${busy ? "true" : "false"}\n\n`);
-                  }
-                };
-                pollBusy();
-                pi = setInterval(pollBusy, 1000);
-              }
+              // plan prompts live in the TUI, not the transcript) plus the busy
+              // state. Emits only on change so the client can render/clear a
+              // prompt panel; pane-less sessions get registry-sourced busy only.
+              const poll = makeSessionStatePoller({
+                sid,
+                tp,
+                target,
+                emitPrompt: (prompt) =>
+                  send(`event: prompt\ndata: ${JSON.stringify(prompt ?? null)}\n\n`),
+                emitBusy: (busy) =>
+                  send(`event: busy\ndata: ${busy ? "true" : "false"}\n\n`),
+              });
+              void poll();
+              pi = setInterval(() => {
+                if (!closed) void poll();
+              }, 1000);
               // Emit the outbound send-queue on change so the composer can show
               // each message's delivery status (pending/queued/delivered/failed).
-              let lastQ = "[]";
-              const pollQueue = () => {
-                if (closed) return;
-                const queue = listQueue(sid);
-                const sig = JSON.stringify(queue);
-                if (sig === lastQ) return;
-                lastQ = sig;
-                send(`event: queue\ndata: ${sig}\n\n`);
-              };
-              pollQueue();
+              const queue = makeQueueWatcher(sid, (q) =>
+                send(`event: queue\ndata: ${JSON.stringify(q)}\n\n`),
+              );
+              queue.poll();
               qi = setInterval(() => {
-                pollQueue();
-                void reconcileQueued(sid).then((c) => c && pollQueue());
+                if (!closed) queue.tick();
               }, 1000);
               hb = setInterval(() => send(`: hb\n\n`), 15000);
             },

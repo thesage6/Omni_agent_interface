@@ -13,7 +13,12 @@
 
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
+// JsonWebKey is a DOM lib type; this backend compiles against ESNext-only libs,
+// so pull the equivalent shape from node:crypto instead.
+import type { webcrypto } from "node:crypto";
 import { PATHS } from "./config.ts";
+
+type JsonWebKey = webcrypto.JsonWebKey;
 
 const dir = () => join(PATHS.data, "push");
 const vapidPath = () => join(dir(), "vapid.json");

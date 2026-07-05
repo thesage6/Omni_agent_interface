@@ -1545,8 +1545,9 @@ export async function resolveTranscript(sessionId: string): Promise<string | nul
   // be written to under ~/.claude/projects/... even if the .jsonl does not exist
   // on disk yet. This lets /api/live/stream establish a tailer immediately; pump
   // will deliver lines as soon as the harness/provider writes the first content.
-  // (Codex-aisdk uses separate rollout paths and threadIds assigned after turn 1.)
-  if (entry?.cwd && entry.agent !== "codex" && entry.agent !== "codex-aisdk") {
+  // (Codex-aisdk uses separate rollout paths and threadIds assigned after turn
+  // 1; its registry entries store agent: "codex" — see codex-aisdk-session.ts.)
+  if (entry?.cwd && entry.agent !== "codex") {
     for (const d of candidateDirs(entry.cwd)) {
       const cand = join(PROJECTS_DIR, d, `${id}.jsonl`);
       return cand;

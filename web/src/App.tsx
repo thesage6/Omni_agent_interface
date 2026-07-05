@@ -97,6 +97,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
+import { timeAgo } from "@/lib/time";
 import { Streamdown } from "streamdown";
 import { marked } from "marked";
 import { useExtensionNavTabs } from "./lib/extensions";
@@ -388,17 +389,6 @@ function logFindingAction(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ path, hadText }),
   }).catch(() => {});
-}
-
-function timeAgo(value?: number | null) {
-  if (!value) return "unknown";
-  const seconds = Math.max(0, Math.round((Date.now() - value) / 1000));
-  if (seconds < 60) return `${seconds}s ago`;
-  const minutes = Math.round(seconds / 60);
-  if (minutes < 60) return `${minutes}m ago`;
-  const hours = Math.round(minutes / 60);
-  if (hours < 48) return `${hours}h ago`;
-  return `${Math.round(hours / 24)}d ago`;
 }
 
 function shortUser(email?: string | null) {
