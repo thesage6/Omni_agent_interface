@@ -15,6 +15,7 @@ import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { timeAgo } from "@/lib/time";
+import { api } from "@/lib/api";
 import BrowserLoginView from "./BrowserLoginView";
 
 // Manage saved cloud-browser login profiles. Each profile captures the cookies
@@ -39,15 +40,6 @@ type TestResult = {
 
 // Mirror of App.tsx's tiny fetch wrapper: relative paths, JSON in/out, throws on
 // non-2xx with the server's `error` field when present.
-async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(path, init);
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    throw new Error((data as { error?: string })?.error || `${res.status} ${res.statusText}`);
-  }
-  return data as T;
-}
-
 // How the live login browser should be sized. "fit" matches the user's own
 // screen so pages lay out the way they're used to; the presets force a classic
 // desktop or phone viewport for testing responsive logins.

@@ -1,7 +1,6 @@
-import { readdir, realpath, stat } from "node:fs/promises";
-import { statSync, mkdirSync, type Dirent } from "node:fs";
-import { tmpdir, homedir } from "node:os";
-import { extname, join } from "node:path";
+import { statSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { marked } from "marked";
 import { PATHS, installInfo } from "../config.ts";
@@ -11,14 +10,17 @@ import {
   loadAgent,
   writeAgent,
 } from "../agents/registry.ts";
-import {
-  parseActions,
-  readActionsSidecar,
-  reportPathFor,
-  runAgent,
-  type ActionRow,
-} from "../agents/runner.ts";
+import { readActionsSidecar } from "../agents/runner.ts";
 import { executeAction, executeActionsCombined, dispatchSendFixAgent } from "../actions/index.ts";
+import {
+  listAgentReports,
+  listLegacyReports,
+  readAgentReport,
+  readLegacyReport,
+  renderReportHtml,
+} from "../agents/reports.ts";
+import { getRun, startRun, type RunState } from "../agents/run-registry.ts";
+import { persistUpload, uploadFilename } from "../uploads.ts";
 import {
   listAutoAgents,
   getAutoAgent,
@@ -104,7 +106,7 @@ import {
 } from "../browser/session.ts";
 import { testProfile } from "../browser/tool.ts";
 import { listCustomRepos, addCustomRepo, removeCustomRepo } from "../repos-store.ts";
-import { projectName, reposRoot } from "../projects.ts";
+import { listRepos, projectName, reposRoot } from "../projects.ts";
 import { resolveSessionCwd, startWorktreeSweep } from "../worktree.ts";
 import {
   synthesizeTts,
@@ -117,62 +119,13 @@ import {
   type SttStreamBridge,
 } from "../voice-providers.ts";
 
-// Where the user keeps the repos lfg can launch agents into. Scanned for git
-// repos at runtime; defaults to ~/repos. The lfg repo itself (PATHS.root) is
-// always offered as a target since it is present and trusted.
-const REPOS_ROOT = reposRoot();
+// The lfg repo itself — always offered as a launch target since it is present
+// and trusted (repo discovery lives in projects.ts listRepos).
 const SELF_REPO = PATHS.root;
 
-function uploadExt(contentType: string, filename: string): string {
-  const fromName = extname(filename).toLowerCase().replace(/^\./, "");
-  if (/^[a-z0-9]{1,12}$/.test(fromName)) return fromName;
-  const ct = contentType.toLowerCase();
-  if (ct.includes("png")) return "png";
-  if (ct.includes("webp")) return "webp";
-  if (ct.includes("gif")) return "gif";
-  if (ct.includes("jpeg") || ct.includes("jpg")) return "jpg";
-  if (ct.includes("pdf")) return "pdf";
-  if (ct.includes("markdown")) return "md";
-  if (ct.includes("json")) return "json";
-  if (ct.includes("html")) return "html";
-  if (ct.includes("text")) return "txt";
-  return "bin";
-}
-
-function uploadStem(filename: string): string {
-  const leaf = filename.split(/[\\/]/).pop() || "";
-  const stem = leaf.replace(/\.[^.]*$/, "").replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
-  return stem.slice(0, 48) || "upload";
-}
-
-async function persistUpload(req: Request, filename: string, prefix = "upload"): Promise<{ path: string; name: string }> {
-  const ct = (req.headers.get("content-type") || "").toLowerCase();
-  const ext = uploadExt(ct, filename);
-  const buf = new Uint8Array(await req.arrayBuffer());
-  if (!buf.length) throw new Error("empty upload");
-  const dir = join(tmpdir(), "lfg-uploads");
-  mkdirSync(dir, { recursive: true });
-  const safePrefix = prefix.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "upload";
-  const name = `${safePrefix}-${Date.now()}-${randomBytes(3).toString("hex")}-${uploadStem(filename)}.${ext}`;
-  const fp = join(dir, name);
-  await Bun.write(fp, buf);
-  return { path: fp, name: filename || name };
-}
-
-function uploadFilename(req: Request, url: URL): string {
-  const rawName = url.searchParams.get("filename") || req.headers.get("x-file-name") || "";
-  try {
-    return decodeURIComponent(rawName);
-  } catch {
-    return rawName;
-  }
-}
-
-// Allowlisted Claude model aliases. They land both on a launch argv (--model)
-// and in a `/model <alias>` slash command we inject mid-session — so an unknown
-// value is a hard 400, never a silent fallback. These mirror Claude Code's own
 // Agent/model catalog — shared with the web UI via src/models.ts so the
-// backend's validation lists and the client's pickers can't drift.
+// backend's validation lists and the client's pickers can't drift. Unknown
+// models land as a hard 400, never a silent fallback.
 import {
   CLAUDE_MODELS,
   AISDK_MODELS,
@@ -195,182 +148,8 @@ const PORT = Number(process.env.LFG_PORT ?? process.env.PORT ?? 8766);
 // if you understand the exposure.
 const HOST = process.env.LFG_HOST ?? "127.0.0.1";
 
-marked.setOptions({ gfm: true, breaks: false });
-
-// Render a report's markdown to HTML, wrapping every table in a horizontal
-// scroll container so wide tables (security posture, pricing, db stats) scroll
-// within their card on mobile instead of blowing out the viewport width.
-function renderReportHtml(raw: string): string {
-  const html = marked.parse(raw) as string;
-  return html
-    .replace(/<table>/g, '<div class="table-wrap"><table>')
-    .replace(/<\/table>/g, "</table></div>");
-}
-
-// ---------- legacy: pre-agents flat reports ----------
-
-async function listLegacyReports() {
-  const dir = join(PATHS.data, "reports");
-  let files: string[];
-  try {
-    files = await readdir(dir);
-  } catch {
-    return [];
-  }
-  const entries = await Promise.all(
-    files
-      .filter((f) => f.endsWith(".md") && /^\d{4}-\d{2}-\d{2}\.md$/.test(f))
-      .map(async (f) => {
-        const s = await stat(join(dir, f));
-        return { date: f.replace(/\.md$/, ""), bytes: s.size, mtime: s.mtimeMs };
-      }),
-  );
-  return entries.sort((a, b) => b.date.localeCompare(a.date));
-}
-
-async function readLegacyReport(date: string): Promise<string | null> {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return null;
-  const f = Bun.file(join(PATHS.data, "reports", `${date}.md`));
-  return (await f.exists()) ? await f.text() : null;
-}
-
-async function listRepos() {
-  let root: string;
-  try {
-    root = await realpath(REPOS_ROOT);
-  } catch {
-    root = REPOS_ROOT;
-  }
-  const repos: Array<{ name: string; cwd: string; project: string; custom?: boolean }> = [];
-  const addRepo = async (name: string, cwd: string, custom = false) => {
-    if (repos.some((r) => r.cwd === cwd)) return;
-    try {
-      await stat(join(cwd, ".git"));
-      const project = projectName(cwd);
-      if (repos.some((r) => r.project === project)) return;
-      repos.push(custom ? { name, cwd, project, custom: true } : { name, cwd, project });
-    } catch {}
-  };
-  let entries: Dirent[] = [];
-  try {
-    entries = await readdir(root, { withFileTypes: true });
-  } catch {}
-  for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
-    if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
-    await addRepo(entry.name, join(root, entry.name));
-  }
-  // Always offer the lfg repo itself as a target — it is present and trusted.
-  await addRepo("lfg", SELF_REPO);
-  // Merge in user-pinned custom paths (repos outside LFG_REPOS_ROOT). Tagged
-  // `custom` so the UI can offer a remove affordance; deduped on cwd against
-  // anything already discovered above.
-  for (const r of await listCustomRepos()) await addRepo(r.name, r.cwd, true);
-  repos.sort((a, b) => a.name.localeCompare(b.name));
-  return repos;
-}
-
-// ---------- agent reports ----------
-
-async function listAgentReports(agent: string) {
-  const dir = join(PATHS.data, "reports", agent);
-  let files: string[];
-  try {
-    files = await readdir(dir);
-  } catch {
-    return [];
-  }
-  const entries = await Promise.all(
-    files
-      .filter((f) => /^\d{4}-\d{2}-\d{2}\.md$/.test(f))
-      .map(async (f) => {
-        const s = await stat(join(dir, f));
-        return { date: f.replace(/\.md$/, ""), bytes: s.size, mtime: s.mtimeMs };
-      }),
-  );
-  return entries.sort((a, b) => b.date.localeCompare(a.date));
-}
-
-async function readAgentReport(agent: string, date: string) {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return null;
-  if (!/^[a-z0-9_-]+$/.test(agent)) return null;
-  const f = Bun.file(reportPathFor(agent, date));
-  if (!(await f.exists())) return null;
-  const raw = await f.text();
-  const parsed = parseActions(agent, date, raw).map((p) => p.id);
-  const sidecar = await readActionsSidecar(agent, date);
-  const byId = new Map(sidecar.map((s) => [s.id, s] as const));
-  const actions = parsed
-    .map((id) => byId.get(id))
-    .filter((r): r is ActionRow => !!r);
-  return { date, raw, html: renderReportHtml(raw), actions };
-}
-
-// ---------- run lifecycle ----------
-
-type RunState = {
-  id: string;
-  agent: string;
-  date: string;
-  startedAt: number;
-  status: "running" | "done" | "failed";
-  logs: string[];
-  result?: unknown;
-  error?: string;
-  subscribers: Set<(ev: { line?: string; final?: RunState }) => void>;
-};
-
-const RUNS = new Map<string, RunState>();
-const RUN_TTL_MS = 60 * 60 * 1000;
-
 // Last successful /api/claude/usage payload (60s TTL).
 let usageCache: { at: number; data: unknown } | null = null;
-
-function evictOldRuns() {
-  const cutoff = Date.now() - RUN_TTL_MS;
-  for (const [k, v] of RUNS) if (v.startedAt < cutoff && v.status !== "running") RUNS.delete(k);
-}
-
-function emit(state: RunState, ev: { line?: string; final?: RunState }) {
-  for (const s of state.subscribers) {
-    try {
-      s(ev);
-    } catch {}
-  }
-}
-
-async function startRun(agent: string): Promise<RunState> {
-  evictOldRuns();
-  const id = randomBytes(6).toString("hex");
-  const state: RunState = {
-    id,
-    agent,
-    date: new Date().toISOString().slice(0, 10),
-    startedAt: Date.now(),
-    status: "running",
-    logs: [],
-    subscribers: new Set(),
-  };
-  RUNS.set(id, state);
-
-  runAgent(agent, {
-    onLog: (line) => {
-      state.logs.push(line);
-      emit(state, { line });
-    },
-  })
-    .then((r) => {
-      state.status = "done";
-      state.result = r;
-      emit(state, { final: state });
-    })
-    .catch((e) => {
-      state.status = "failed";
-      state.error = e instanceof Error ? e.message : String(e);
-      emit(state, { final: state });
-    });
-
-  return state;
-}
 
 // ---------- HTTP helpers ----------
 
@@ -1615,7 +1394,7 @@ export async function cmdServe() {
       const resolveAutoCwd = async (cwd: unknown): Promise<string | undefined> => {
         const want = typeof cwd === "string" ? cwd.trim() : "";
         if (!want) return undefined;
-        return (await listRepos()).find((r) => r.cwd === want)?.cwd;
+        return (await listRepos(SELF_REPO)).find((r) => r.cwd === want)?.cwd;
       };
       if (path === "/api/auto/enhance-prompt" && req.method === "POST") {
         const b = (await req.json().catch(() => null)) as {
@@ -1902,7 +1681,7 @@ export async function cmdServe() {
       {
         const m = path.match(/^\/api\/agents\/([a-z0-9_-]+)\/runs\/([0-9a-f]+)$/);
         if (m) {
-          const state = RUNS.get(m[2]);
+          const state = getRun(m[2]);
           if (!state) return err(404, "run not found");
           if (req.headers.get("accept")?.includes("text/event-stream")) {
             const stream = new ReadableStream({
@@ -2080,16 +1859,16 @@ export async function cmdServe() {
           } catch (e) {
             return err(400, e instanceof Error ? e.message : String(e));
           }
-          return json({ repos: await listRepos() });
+          return json({ repos: await listRepos(SELF_REPO) });
         }
         if (req.method === "DELETE") {
           const b = (await req.json().catch(() => null)) as { cwd?: unknown } | null;
           const cwd = typeof b?.cwd === "string" ? b.cwd : "";
           if (!cwd.trim()) return err(400, "cwd is required");
           await removeCustomRepo(cwd);
-          return json({ repos: await listRepos() });
+          return json({ repos: await listRepos(SELF_REPO) });
         }
-        return json({ repos: await listRepos() });
+        return json({ repos: await listRepos(SELF_REPO) });
       }
 
       if (path === "/api/sessions") {
@@ -2268,7 +2047,7 @@ export async function cmdServe() {
             ? await cwdForCodexTranscript(transcript).catch(() => null)
             : await cwdForTranscript(transcript).catch(() => null);
           const sourceCwd = source?.cwd || transcriptCwd || SELF_REPO;
-          const repos = await listRepos();
+          const repos = await listRepos(SELF_REPO);
           const repo =
             repos.find((r) => r.cwd === sourceCwd) ??
             repos.find((r) => r.project === projectName(sourceCwd));
@@ -2390,7 +2169,7 @@ export async function cmdServe() {
         // lfg-sessions skill is installed user-level (~/.claude/skills) so the
         // voice/orchestrator agent gets it regardless of cwd.
         const requestedCwd = body?.cwd?.trim() || SELF_REPO;
-        const repo = (await listRepos()).find((r) => r.cwd === requestedCwd);
+        const repo = (await listRepos(SELF_REPO)).find((r) => r.cwd === requestedCwd);
         if (!repo) return err(400, "unknown repo");
         const tmuxName = `lfg-${randomBytes(3).toString("hex")}`;
         const cwdResolved = resolveSessionCwd(repo.cwd, tmuxName, {

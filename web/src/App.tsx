@@ -98,6 +98,36 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
 import { timeAgo } from "@/lib/time";
+import { api } from "@/lib/api";
+import {
+  composeAttachmentMessage,
+  cycleProjectFilter,
+  escapeHtml,
+  formatBytes,
+  normText,
+  projectName,
+  repoProject,
+  shortProject,
+  shortUser,
+  titleForSession,
+} from "@/lib/format";
+import { agentIconAlt, agentIconSrc, canDriveSession, isHarnessAgent } from "@/lib/agents";
+import { floatToWav, joinTranscript, pcm16kFrom } from "@/lib/audio";
+import type {
+  Agent,
+  AgentReport,
+  AutoAgent,
+  AutoFinding,
+  ComposerAttachment,
+  LaunchingSession,
+  Message,
+  QueueMsg,
+  Repo,
+  ReportRef,
+  Session,
+  SessionPrompt,
+  User,
+} from "./types";
 import {
   AGENT_DEFAULT_MODEL,
   AGENT_MODELS,
@@ -121,129 +151,6 @@ import {
   disablePush,
 } from "./lib/push";
 import { AskNavButton, AskPage, AskProvider } from "./components/ask-center";
-
-type Agent = {
-  name: string;
-  title: string;
-  enabled: boolean;
-  inputCount: number;
-  lastReport: ReportRef | null;
-};
-
-type ReportRef = {
-  date: string;
-  bytes: number;
-  mtime: number;
-};
-
-type ActionRow = {
-  id: string;
-  idx?: number;
-  text: string;
-  status: "pending" | "running" | "done" | "failed";
-  result?: { ok: boolean; summary: string };
-};
-
-type AgentReport = {
-  date: string;
-  raw: string;
-  html: string;
-  actions: ActionRow[];
-};
-
-type Session = {
-  agent?: "claude" | "aisdk" | "codex" | "codex-aisdk" | "opencode" | "grok" | string;
-  pid?: number;
-  cmd?: string;
-  cwd?: string;
-  project?: string;
-  title?: string | null;
-  lastUserText?: string | null;
-  sessionId: string | null;
-  startedAt?: number | null;
-  lastActivityAt?: number | null;
-  last?: { role?: string; kind?: string; text?: string; ts?: number };
-  tmuxTarget?: string | null;
-  tmuxName?: string | null;
-  managed?: boolean;
-  assignedUser?: string | null;
-  model?: string | null;
-  // Build health (from the backend). "blocked" means the session can't make
-  // progress until a human acts; statusReason/statusDetail explain why.
-  status?: "ok" | "blocked";
-  statusReason?: "model_unavailable" | "out_of_credits" | "provider_auth" | "provider_error" | null;
-  statusDetail?: string | null;
-  // Live "working" flag from the list call (backend computes it from the tmux
-  // pane / aisdk registry). Lets a collapsed card show working/idle without
-  // holding open a transcript stream — the stream only overrides this while the
-  // card is expanded. Polled every 5s with the rest of the list.
-  busy?: boolean;
-};
-
-// An optimistic placeholder for a session that's mid-spawn: rendered as a
-// "starting…" card until the real session shows up in the next list refresh.
-type LaunchingSession = { id: string; prompt: string; agent: string };
-
-type User = { email: string; name?: string; avatar?: string };
-type Repo = { name: string; cwd: string; project?: string; custom?: boolean };
-
-// Auto agents: a streamlined agent is JUST a prompt + a schedule. It emits
-// findings (notifications), not reports.
-type AutoAgent = {
-  id: string;
-  name: string;
-  prompt: string;
-  schedule: string;
-  enabled: boolean;
-  cwd?: string;
-  agent?: AutoAgentBackend;
-  model?: string;
-  thinkingLevel?: string;
-  lastRunAt?: number;
-  running?: boolean; // mid-run right now (live, from the server poll)
-};
-
-type AutoFinding = {
-  id: string;
-  agentId: string;
-  title: string;
-  reasoning: string[];
-  suggest?: string;
-  severity: "high" | "med" | "low";
-  createdAt: number;
-  status: "open" | "dismissed" | "session" | "read";
-  sessionId?: string;
-};
-
-type Message = {
-  id?: string;
-  role?: string;
-  kind?: string;
-  text?: string;
-  html?: string;
-  ts?: number;
-  pending?: boolean;
-};
-
-type PromptOption = { index: number; label: string; selected?: boolean };
-type SessionPrompt = { question?: string; options: PromptOption[] };
-type QueueMsg = {
-  id: string;
-  text: string;
-  status: "pending" | "sending" | "queued" | "failed" | "delivered";
-  error?: string;
-};
-
-type ComposerAttachment = {
-  id: string;
-  file: File;
-  name: string;
-  size: number;
-  type: string;
-  previewUrl?: string;
-  status: "ready" | "uploading" | "failed";
-  error?: string;
-};
 
 // Match the server's markdown rendering (serve.ts: marked.setOptions({ gfm:
 // true, breaks: false })) so the optimistic placeholder's HTML is identical to
@@ -281,52 +188,6 @@ const AGENT_OPTIONS: { key: AgentKind; label: string; Icon: typeof Sparkles }[] 
 
 // Maps an agent-kind to its session-card / picker icon. codex variants share the
 // codex mark; claude variants (incl. aisdk) share the claude mark.
-function agentIconSrc(agent?: string): string {
-  if (agent === "codex" || agent === "codex-aisdk") return "/agent-codex.svg";
-  if (agent === "grok") return "/agent-grok.svg";
-  if (agent === "opencode") return "/agent-opencode.svg";
-  return "/agent-claude.svg";
-}
-function agentIconAlt(agent?: string): string {
-  if (agent === "codex" || agent === "codex-aisdk") return "Codex";
-  if (agent === "grok") return "Grok";
-  if (agent === "opencode") return "OpenCode";
-  return "Claude";
-}
-
-function isHarnessAgent(agent?: string | null): boolean {
-  return agent === "aisdk" || agent === "codex-aisdk" || agent === "opencode";
-}
-
-function canDriveSession(session: Pick<Session, "agent" | "tmuxTarget">): boolean {
-  return !!session.tmuxTarget || isHarnessAgent(session.agent);
-}
-
-async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(path, init);
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    throw new Error(data?.error || `${res.status} ${res.statusText}`);
-  }
-  return data as T;
-}
-
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(bytes < 10 * 1024 * 1024 ? 1 : 0)} MB`;
-}
-
-function composeAttachmentMessage(
-  text: string,
-  files: { name: string; path: string }[],
-): string {
-  if (!files.length) return text;
-  const label = files.length === 1 ? "Attached file" : "Attached files";
-  const list = files.map((file) => `- ${file.name}: ${file.path}`).join("\n");
-  return [text, `${label}:\n${list}`].filter(Boolean).join("\n\n");
-}
-
 // Fire-and-forget instrumentation: record which CTA a finding graduated
 // through (composer send vs one-tap "Make the change" vs dismiss) and whether
 // the user had typed an instruction first. Never block or surface errors — a
@@ -343,50 +204,6 @@ function logFindingAction(
   }).catch(() => {});
 }
 
-function shortUser(email?: string | null) {
-  return email ? email.split("@")[0] : "unassigned";
-}
-
-// A human-friendly label for a project. Current backend payloads use the
-// top-level folder under the repos root. The legacy dash-encoded full-path shape
-// is still accepted so old selected filters degrade cleanly.
-function shortProject(project: string): string {
-  const legacy = project.match(/(?:^|-)repos-(.+)$/)?.[1];
-  if (legacy) return legacy;
-  return project;
-}
-
-function cycleProjectFilter(options: string[], current: string, dir: 1 | -1): string {
-  if (options.length <= 1) return current;
-  const idx = Math.max(0, options.indexOf(current));
-  return options[(idx + dir + options.length) % options.length];
-}
-
-// Fallback mirror of the backend's projectName(cwd): use the top-level folder
-// under a repos root when recognizable, otherwise the cwd basename. Newer
-// /api/repos payloads include `project`, so this mainly supports older payloads.
-function projectName(cwd: string): string {
-  const parts = cwd.split(/[\\/]/).filter(Boolean);
-  const reposIdx = parts.lastIndexOf("repos");
-  if (reposIdx >= 0 && parts[reposIdx + 1]) return parts[reposIdx + 1];
-  return parts[parts.length - 1] || cwd;
-}
-
-function repoProject(repo: Repo): string {
-  return repo.project || projectName(repo.cwd);
-}
-
-function titleForSession(session: Session) {
-  return (
-    session.title ||
-    session.lastUserText ||
-    session.tmuxName ||
-    session.project ||
-    session.sessionId?.slice(0, 8) ||
-    "session"
-  );
-}
-
 // The most recent activity condensed to one line — used as the collapsed-card
 // subtitle. Reuses the exact transcript shortening (buildRenderItems +
 // toolGroupLabel): a run of tool calls/results renders as its group summary
@@ -397,87 +214,6 @@ function latestLine(messages: Message[]): string {
   const last = items[items.length - 1];
   if (!last) return "";
   return last.type === "tools" ? toolGroupLabel(last.items) : normText(last.message.text);
-}
-
-function escapeHtml(value: string) {
-  return value.replace(/[&<>]/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[ch]!);
-}
-
-function normText(value?: string) {
-  return (value || "").replace(/\s+/g, " ").trim();
-}
-
-// Encode captured PCM (Float32) as a 16-bit mono WAV — the format the server's
-// /api/voice/stt (faster-whisper) accepts. We capture raw PCM via the Web Audio
-// API rather than MediaRecorder because MediaRecorder emits webm/opus (Chrome)
-// or mp4/aac (iOS Safari), neither of which the upstream takes; PCM→WAV is the
-// one path that works the same on every browser, iOS included.
-function floatToWav(samples: Float32Array, rate: number): Blob {
-  const buffer = new ArrayBuffer(44 + samples.length * 2);
-  const view = new DataView(buffer);
-  const str = (offset: number, s: string) => {
-    for (let i = 0; i < s.length; i++) view.setUint8(offset + i, s.charCodeAt(i));
-  };
-  str(0, "RIFF");
-  view.setUint32(4, 36 + samples.length * 2, true);
-  str(8, "WAVE");
-  str(12, "fmt ");
-  view.setUint32(16, 16, true);
-  view.setUint16(20, 1, true);
-  view.setUint16(22, 1, true);
-  view.setUint32(24, rate, true);
-  view.setUint32(28, rate * 2, true);
-  view.setUint16(32, 2, true);
-  view.setUint16(34, 16, true);
-  str(36, "data");
-  view.setUint32(40, samples.length * 2, true);
-  let offset = 44;
-  for (let i = 0; i < samples.length; i++) {
-    const v = Math.max(-1, Math.min(1, samples[i]));
-    view.setInt16(offset, v * 32767, true);
-    offset += 2;
-  }
-  return new Blob([buffer], { type: "application/octet-stream" });
-}
-
-// Resample a Float32 PCM window (captured at the AudioContext's native rate) to
-// the 16 kHz mono signed-16-bit PCM the realtime-STT bridge expects, returning a
-// fresh ArrayBuffer ready to ship as a binary WS frame. We request a 16 kHz
-// context up front (so this is usually a straight float→int16 cast), but some
-// browsers — iOS Safari especially — ignore the requested rate and hand back
-// 44.1/48 kHz, so we linear-interpolate down when the rates differ. int16 frames
-// are little-endian on every browser we target, which is what the upstream wants.
-function pcm16kFrom(samples: Float32Array, inRate: number): ArrayBuffer {
-  const clamp = (s: number) => {
-    const v = Math.max(-1, Math.min(1, s));
-    return v < 0 ? v * 32768 : v * 32767;
-  };
-  if (inRate === 16000) {
-    const out = new Int16Array(samples.length);
-    for (let i = 0; i < samples.length; i++) out[i] = clamp(samples[i]);
-    return out.buffer;
-  }
-  const ratio = inRate / 16000;
-  const outLen = Math.max(0, Math.floor(samples.length / ratio));
-  const out = new Int16Array(outLen);
-  for (let i = 0; i < outLen; i++) {
-    const idx = i * ratio;
-    const i0 = Math.floor(idx);
-    const i1 = Math.min(i0 + 1, samples.length - 1);
-    const frac = idx - i0;
-    out[i] = clamp(samples[i0] * (1 - frac) + samples[i1] * frac);
-  }
-  return out.buffer;
-}
-
-// Join the finalized + in-flight halves of a streaming transcript into the one
-// string the input should show. Both halves are trimmed and empties dropped so a
-// trailing space or a not-yet-started partial never leaks into the field.
-function joinTranscript(committed: string, partial: string): string {
-  return [committed, partial]
-    .map((t) => t.trim())
-    .filter(Boolean)
-    .join(" ");
 }
 
 type DictationState = "idle" | "recording" | "transcribing";

@@ -1,6 +1,8 @@
 import { homedir } from "node:os";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, statSync, type Dirent } from "node:fs";
+import { readdir, realpath as realpathAsync, stat as statAsync } from "node:fs/promises";
 import { basename, join, relative, resolve } from "node:path";
+import { listCustomRepos } from "./repos-store.ts";
 
 export function reposRoot(): string {
   return process.env.LFG_REPOS_ROOT ?? `${homedir()}/repos`;
@@ -41,4 +43,42 @@ export function projectName(cwd: string | null): string {
   const absCwd = resolve(cwd);
   const main = worktreeMainPath(absCwd);
   return topFolderName(main ?? absCwd);
+}
+
+// Launchable repos: git repos directly under LFG_REPOS_ROOT, plus the lfg repo
+// itself (always present and trusted), plus user-pinned custom paths from
+// repos-store. De-duplicated on cwd and on project identity.
+export async function listRepos(selfRepo: string) {
+  let root: string;
+  try {
+    root = await realpathAsync(reposRoot());
+  } catch {
+    root = reposRoot();
+  }
+  const repos: Array<{ name: string; cwd: string; project: string; custom?: boolean }> = [];
+  const addRepo = async (name: string, cwd: string, custom = false) => {
+    if (repos.some((r) => r.cwd === cwd)) return;
+    try {
+      await statAsync(join(cwd, ".git"));
+      const project = projectName(cwd);
+      if (repos.some((r) => r.project === project)) return;
+      repos.push(custom ? { name, cwd, project, custom: true } : { name, cwd, project });
+    } catch {}
+  };
+  let entries: Dirent[] = [];
+  try {
+    entries = await readdir(root, { withFileTypes: true });
+  } catch {}
+  for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+    if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
+    await addRepo(entry.name, join(root, entry.name));
+  }
+  // Always offer the lfg repo itself as a target — it is present and trusted.
+  await addRepo("lfg", selfRepo);
+  // Merge in user-pinned custom paths (repos outside LFG_REPOS_ROOT). Tagged
+  // `custom` so the UI can offer a remove affordance; deduped on cwd against
+  // anything already discovered above.
+  for (const r of await listCustomRepos()) await addRepo(r.name, r.cwd, true);
+  repos.sort((a, b) => a.name.localeCompare(b.name));
+  return repos;
 }
