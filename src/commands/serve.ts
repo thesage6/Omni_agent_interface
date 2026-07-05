@@ -171,43 +171,19 @@ function uploadFilename(req: Request, url: URL): string {
 // Allowlisted Claude model aliases. They land both on a launch argv (--model)
 // and in a `/model <alias>` slash command we inject mid-session — so an unknown
 // value is a hard 400, never a silent fallback. These mirror Claude Code's own
-// `/model` aliases (same set the --model flag accepts).
-const CLAUDE_MODELS = ["fable", "opus", "sonnet", "haiku"];
-// Models the "aisdk" session kind accepts (the provider maps these aliases).
-const AISDK_MODELS = ["opus", "sonnet", "haiku"];
-const GROK_MODELS = ["grok-composer-2.5-fast", "grok-build"];
-const GROK_DEFAULT_MODEL = "grok-composer-2.5-fast";
-const OPENCODE_DEFAULT_MODEL = "opencode-go/deepseek-v4-flash";
-// Models whose provider currently rejects our requests (Sakana's fugu returns a
-// hard 403 Forbidden, and the local Novita credential currently 403s too — see
-// opencode.log). A session born onto one of these streams zero output and
-// silently goes idle, so redirect create + model-switch away from them to the
-// verified OpenCode Go default instead of letting the turn die.
-const OPENCODE_DISABLED_MODELS = new Set<string>([
-  "fugu/fugu",
-  "fugu/fugu-ultra",
-  "fugu",
-  "fugu-ultra",
-  "novita-ai/deepseek/deepseek-v4-pro",
-  "novita-ai/zai-org/glm-5.2",
-  "novita-ai/zai-org/glm-5.1",
-]);
-const AUTO_AGENT_BACKENDS = ["aisdk", "codex-aisdk", "opencode"] as const;
-// Reasoning/thinking-effort levels, per agent family. Codex (CLI + ai-sdk)
-// accepts none…xhigh; Claude (CLI + ai-sdk) accepts low…xhigh plus `max`. The
-// dashboard picker only offers the low/medium/high/xhigh overlap, but the
-// endpoint validates against the agent's own set so an out-of-range value (e.g.
-// a voice-supplied `none` for Claude, or `max` for Codex) is a clean 400 rather
-// than a session that boots into an error.
-const CODEX_THINKING_LEVELS = ["none", "minimal", "low", "medium", "high", "xhigh"] as const;
-const CLAUDE_THINKING_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
-// The levels a given agent kind honors, or null when the agent has no
-// thinking/reasoning knob at all (opencode's provider exposes none).
-function thinkingLevelsForAgent(agent: string): readonly string[] | null {
-  if (agent === "claude" || agent === "aisdk" || agent === "grok") return CLAUDE_THINKING_LEVELS;
-  if (agent === "codex" || agent === "codex-aisdk") return CODEX_THINKING_LEVELS;
-  return null;
-}
+// Agent/model catalog — shared with the web UI via src/models.ts so the
+// backend's validation lists and the client's pickers can't drift.
+import {
+  CLAUDE_MODELS,
+  AISDK_MODELS,
+  GROK_MODELS,
+  GROK_DEFAULT_MODEL,
+  OPENCODE_DEFAULT_MODEL,
+  OPENCODE_DISABLED_MODELS,
+  AUTO_AGENT_BACKENDS,
+  thinkingLevelsForAgent,
+  modelCatalog,
+} from "../models.ts";
 import { enqueueMessage, listQueue, retryMessage, clearResolved, reconcileQueued, getMessage } from "../sendq.ts";
 import { startFleetWatcher, subscribeFleet, type FleetEvent } from "../voice-bus.ts";
 import { handleElevenLlm, handleElevenToken } from "../voice-eleven-llm.ts";
@@ -2129,6 +2105,13 @@ export async function cmdServe() {
       // self-cached for 60s inside getAllUsage().
       if (path === "/api/usage") {
         return json({ providers: await getAllUsage() });
+      }
+
+      // The launchable agent/model catalog (see src/models.ts). The bundled web
+      // UI imports the module directly at build time; this endpoint is for
+      // external clients (voice tools, extensions, scripts).
+      if (path === "/api/models") {
+        return json(modelCatalog());
       }
 
       // Claude subscription usage (5-hour + 7-day windows) via the OAuth usage

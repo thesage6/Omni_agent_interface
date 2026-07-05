@@ -98,6 +98,16 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
 import { timeAgo } from "@/lib/time";
+import {
+  AGENT_DEFAULT_MODEL,
+  AGENT_MODELS,
+  CLAUDE_MODELS,
+  PICKER_THINKING_LEVELS,
+  agentSupportsThinking,
+  type AgentKind,
+  type AutoAgentBackend,
+  type ThinkingLevel,
+} from "../../src/models.ts";
 import { Streamdown } from "streamdown";
 import { marked } from "marked";
 import { useExtensionNavTabs } from "./lib/extensions";
@@ -241,32 +251,10 @@ type ComposerAttachment = {
 // pending bubble is swapped for the streamed one.
 marked.setOptions({ gfm: true, breaks: false });
 
-const CLAUDE_MODELS = ["sonnet", "opus", "haiku", "fable"];
-const CODEX_MODELS = ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"];
-// Models the one-shot AI-SDK test option supports (the provider maps these
-// aliases). Kept in sync with the AISDK_MODELS allowlist in serve.ts.
-const AISDK_MODELS = ["opus", "sonnet", "haiku"];
-const CODEX_AISDK_MODELS = ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"];
-const GROK_MODELS = ["grok-composer-2.5-fast", "grok-build"];
-const OPENCODE_MODELS = [
-  "opencode-go/deepseek-v4-flash",
-  "opencode-go/deepseek-v4-pro",
-  "opencode-go/glm-5.1",
-  "opencode-go/glm-5.2",
-  "opencode-go/kimi-k2.6",
-  "opencode-go/kimi-k2.7-code",
-  "opencode-go/mimo-v2.5",
-  "opencode-go/mimo-v2.5-pro",
-  "opencode-go/minimax-m2.7",
-  "opencode-go/minimax-m3",
-  "opencode-go/qwen3.6-plus",
-  "opencode-go/qwen3.7-max",
-  "opencode-go/qwen3.7-plus",
-  "opencode/big-pickle",
-];
-const THINKING_LEVELS = ["low", "medium", "high", "xhigh"] as const;
-type ThinkingLevel = (typeof THINKING_LEVELS)[number];
-type AutoAgentBackend = "aisdk" | "codex-aisdk" | "opencode";
+// The agent/model catalog lives in src/models.ts at the repo root — one module
+// shared with the backend (which validates against the same lists), imported
+// here at build time so the pickers and the server can't drift.
+const THINKING_LEVELS = PICKER_THINKING_LEVELS;
 const AUTO_AGENT_OPTIONS: { key: AutoAgentBackend; label: string }[] = [
   { key: "aisdk", label: "claude" },
   { key: "codex-aisdk", label: "codex" },
@@ -277,45 +265,9 @@ function savedThinkingLevel(): ThinkingLevel {
   return THINKING_LEVELS.includes(value as ThinkingLevel) ? (value as ThinkingLevel) : "medium";
 }
 
-type AgentKind = "claude" | "aisdk" | "codex" | "codex-aisdk" | "opencode" | "grok";
-
-// Which agents honor a thinking/reasoning-effort level. Claude (CLI + ai-sdk)
-// takes an `effort`; Codex (CLI + ai-sdk) takes a `reasoning_effort` — both
-// accept the low/medium/high/xhigh values the picker offers. OpenCode's provider
-// exposes no reasoning knob, so the selector is hidden for it.
-function agentSupportsThinking(agent: AgentKind): boolean {
-  return (
-    agent === "claude" ||
-    agent === "aisdk" ||
-    agent === "grok" ||
-    agent === "codex" ||
-    agent === "codex-aisdk"
-  );
-}
-
 function agentShowsClaudeUsage(agent: AgentKind): boolean {
   return agent === "claude" || agent === "aisdk";
 }
-
-// Per-agent model lists + default model, keyed by the backend agent-kind
-// contract. The new-session dialog and session cards both read from here so the
-// model picker stays correct per agent.
-const AGENT_MODELS: Record<AgentKind, string[]> = {
-  claude: CLAUDE_MODELS,
-  aisdk: AISDK_MODELS,
-  codex: CODEX_MODELS,
-  "codex-aisdk": CODEX_AISDK_MODELS,
-  grok: GROK_MODELS,
-  opencode: OPENCODE_MODELS,
-};
-const AGENT_DEFAULT_MODEL: Record<AgentKind, string> = {
-  claude: "sonnet",
-  aisdk: "opus",
-  codex: "gpt-5.5",
-  "codex-aisdk": "gpt-5.5",
-  grok: "grok-composer-2.5-fast",
-  opencode: "opencode-go/deepseek-v4-flash",
-};
 
 // New-session picker options, in display order. The three AI-SDK agents are the
 // only choices ("aisdk" leads since it's the default). Each carries a short
